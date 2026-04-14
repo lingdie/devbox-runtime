@@ -22,6 +22,35 @@ on:
         required: false
         type: string
         default: ''
+      target_kind:
+        description: 'Build all kinds or narrow to one kind before applying target_name'
+        required: false
+        type: choice
+        options:
+          - all
+          - operating-systems
+          - languages
+          - frameworks
+        default: 'all'
+      target_name:
+        description: 'Optional package folder or subpath (for example: debian/12.6, node.js/20, nest.js/v11)'
+        required: false
+        type: string
+        default: ''
+      target_build_type:
+        description: 'Build images, runtimes, or both for the selected target; use runtimes for one-click framework runtime builds'
+        required: false
+        type: choice
+        options:
+          - all
+          - images
+          - runtimes
+        default: 'all'
+      include_prerequisites:
+        description: 'When targeting a subset, also build required upstream tools/images first (recommended for single runtime builds)'
+        required: false
+        type: boolean
+        default: true
       l10n:
         description: 'Localization setting (choose one or both)'
         required: false
@@ -41,7 +70,7 @@ on:
           - both
         default: 'amd64'
       aliyun_enabled:
-        description: 'Enable Aliyun ACR builds'
+        description: 'Enable Aliyun ACR login, image push, and manifest publish'
         required: false
         type: boolean
         default: false
@@ -51,8 +80,432 @@ permissions:
   packages: write
 
 jobs:
+  resolve-plan:
+    name: Resolve Build Plan
+    runs-on: ubuntu-latest
+    outputs:
+      build_tools: ${{ steps.plan.outputs.build_tools }}
+      effective_tools_version: ${{ steps.plan.outputs.effective_tools_version }}
+      build_os_base: ${{ steps.plan.outputs.build_os_base }}
+      os_base_name: ${{ steps.plan.outputs.os_base_name }}
+      build_language_base: ${{ steps.plan.outputs.build_language_base }}
+      language_base_name: ${{ steps.plan.outputs.language_base_name }}
+      build_framework_base: ${{ steps.plan.outputs.build_framework_base }}
+      framework_base_name: ${{ steps.plan.outputs.framework_base_name }}
+      build_os_runtime: ${{ steps.plan.outputs.build_os_runtime }}
+      os_runtime_name: ${{ steps.plan.outputs.os_runtime_name }}
+      build_language_runtime: ${{ steps.plan.outputs.build_language_runtime }}
+      language_runtime_name: ${{ steps.plan.outputs.language_runtime_name }}
+      build_framework_runtime: ${{ steps.plan.outputs.build_framework_runtime }}
+      framework_runtime_name: ${{ steps.plan.outputs.framework_runtime_name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve requested stages
+        id: plan
+        shell: bash
+        env:
+          TARGET_KIND: ${{ inputs.target_kind }}
+          TARGET_NAME: ${{ inputs.target_name }}
+          TARGET_BUILD_TYPE: ${{ inputs.target_build_type }}
+          INCLUDE_PREREQUISITES: ${{ inputs.include_prerequisites && 'true' || 'false' }}
+          EFFECTIVE_TOOLS_VERSION: ${{ inputs.tools_version != '' && inputs.tools_version || inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          target_kind="$TARGET_KIND"
+          target_name="$TARGET_NAME"
+          target_build_type="$TARGET_BUILD_TYPE"
+          include_prerequisites="$INCLUDE_PREREQUISITES"
+
+          declare -A flags=(
+            [build_tools]=false
+            [build_os_base]=false
+            [build_language_base]=false
+            [build_framework_base]=false
+            [build_os_runtime]=false
+            [build_language_runtime]=false
+            [build_framework_runtime]=false
+          )
+
+          declare -A fallback_names=(
+            [os_base]=''
+            [language_base]=''
+            [framework_base]=''
+            [os_runtime]=''
+            [language_runtime]=''
+            [framework_runtime]=''
+          )
+
+          tmpdir="$(mktemp -d)"
+          trap 'rm -rf "$tmpdir"' EXIT
+
+          declare -A stage_files=(
+            [os_base]="$tmpdir/os_base.txt"
+            [language_base]="$tmpdir/language_base.txt"
+            [framework_base]="$tmpdir/framework_base.txt"
+          )
+
+          : > "${stage_files[os_base]}"
+          : > "${stage_files[language_base]}"
+          : > "${stage_files[framework_base]}"
+
+          image_map="$tmpdir/image-map.tsv"
+          : > "$image_map"
+
+          while IFS= read -r dockerfile; do
+            version="$(basename "$(dirname "$dockerfile")")"
+            package_name="$(basename "$(dirname "$(dirname "$dockerfile")")")"
+            image_name="${package_name}-${version}"
+            printf '%s\t%s\n' "$image_name" "$dockerfile" >> "$image_map"
+          done < <(find experimental/images -type f -name Dockerfile | sort)
+
+          add_unique_name() {
+            local file="$1"
+            local value="$2"
+            if [ -z "$value" ]; then
+              return
+            fi
+            if ! grep -Fxq "$value" "$file"; then
+              printf '%s\n' "$value" >> "$file"
+            fi
+          }
+
+          select_dockerfiles() {
+            local build_root="$1"
+            local kind="$2"
+            local name="$3"
+            local root="experimental/$build_root/$kind"
+            if [ -n "$name" ]; then
+              root="$root/$name"
+            fi
+            if [ ! -e "$root" ]; then
+              echo "Error: target path '$root' does not exist" >&2
+              exit 1
+            fi
+            find "$root" -name Dockerfile | sort
+          }
+
+          lookup_image_dockerfile() {
+            local image_name="$1"
+            awk -F '\t' -v image_name="$image_name" '$1 == image_name { print $2; exit }' "$image_map"
+          }
+
+          list_internal_dependencies() {
+            sed -nE 's#^FROM \$\{REGISTRY\}/\$\{REPO\}/([^:[:space:]]+):.*#\1#p' "$1"
+          }
+
+          mark_selected_image_stage() {
+            case "$target_kind" in
+              operating-systems)
+                flags[build_os_base]=true
+                fallback_names[os_base]="$target_name"
+                ;;
+              languages)
+                flags[build_language_base]=true
+                fallback_names[language_base]="$target_name"
+                ;;
+              frameworks)
+                flags[build_framework_base]=true
+                fallback_names[framework_base]="$target_name"
+                ;;
+              *)
+                echo "Error: unsupported target kind '$target_kind'" >&2
+                exit 1
+                ;;
+            esac
+          }
+
+          mark_selected_runtime_stage() {
+            case "$target_kind" in
+              operating-systems)
+                flags[build_os_runtime]=true
+                fallback_names[os_runtime]="$target_name"
+                ;;
+              languages)
+                flags[build_language_runtime]=true
+                fallback_names[language_runtime]="$target_name"
+                ;;
+              frameworks)
+                flags[build_framework_runtime]=true
+                fallback_names[framework_runtime]="$target_name"
+                ;;
+              *)
+                echo "Error: unsupported target kind '$target_kind'" >&2
+                exit 1
+                ;;
+            esac
+          }
+
+          mark_base_stage_for_image() {
+            local dockerfile="$1"
+            local rel="${dockerfile#experimental/images/}"
+            local kind="${rel%%/*}"
+            local package_path="${rel#${kind}/}"
+            package_path="${package_path%/Dockerfile}"
+
+            case "$kind" in
+              operating-systems)
+                flags[build_os_base]=true
+                add_unique_name "${stage_files[os_base]}" "$package_path"
+                ;;
+              languages)
+                flags[build_language_base]=true
+                add_unique_name "${stage_files[language_base]}" "$package_path"
+                ;;
+              frameworks)
+                flags[build_framework_base]=true
+                add_unique_name "${stage_files[framework_base]}" "$package_path"
+                ;;
+              *)
+                echo "Error: unsupported image kind '$kind' while resolving $dockerfile" >&2
+                exit 1
+                ;;
+            esac
+          }
+
+          declare -A seen_dockerfiles=()
+
+          resolve_image_dependencies() {
+            local dockerfile="$1"
+            local dep_image=""
+            local dep_dockerfile=""
+
+            if [ -n "${seen_dockerfiles[$dockerfile]:-}" ]; then
+              return
+            fi
+            seen_dockerfiles[$dockerfile]=1
+
+            mark_base_stage_for_image "$dockerfile"
+
+            while IFS= read -r dep_image; do
+              if [ -z "$dep_image" ]; then
+                continue
+              fi
+              if [ "$dep_image" = "base-tools" ]; then
+                flags[build_tools]=true
+                continue
+              fi
+              dep_dockerfile="$(lookup_image_dockerfile "$dep_image")"
+              if [ -z "$dep_dockerfile" ]; then
+                echo "Error: could not resolve internal dependency '$dep_image' referenced by $dockerfile" >&2
+                exit 1
+              fi
+              resolve_image_dependencies "$dep_dockerfile"
+            done < <(list_internal_dependencies "$dockerfile")
+          }
+
+          finalize_stage_name() {
+            local stage="$1"
+            local file="${stage_files[$stage]}"
+            local fallback="${fallback_names[$stage]}"
+            local count=""
+
+            count="$(sed '/^$/d' "$file" | sort -u | wc -l | tr -d ' ')"
+            if [ "$count" = "1" ]; then
+              sed '/^$/d' "$file" | sort -u | head -n 1
+            elif [ -n "$fallback" ]; then
+              printf '%s\n' "$fallback"
+            fi
+          }
+
+          if [ -n "$target_name" ] && [ "$target_kind" = "all" ]; then
+            echo "Error: target_name can only be used when target_kind is operating-systems, languages, or frameworks." >&2
+            exit 1
+          fi
+
+          if [ -n "$target_name" ]; then
+            if [ "$target_build_type" = "images" ] || [ "$target_build_type" = "all" ]; then
+              mapfile -t _selected_images < <(select_dockerfiles images "$target_kind" "$target_name")
+            fi
+
+            if [ "$target_build_type" = "runtimes" ] || [ "$target_build_type" = "all" ]; then
+              mapfile -t _selected_runtimes < <(select_dockerfiles runtimes "$target_kind" "$target_name")
+              mapfile -t _selected_runtime_base_images < <(select_dockerfiles images "$target_kind" "$target_name")
+            fi
+
+            if [ "$include_prerequisites" = "true" ]; then
+              if [ "$target_build_type" = "images" ] || [ "$target_build_type" = "all" ]; then
+                for dockerfile in "${_selected_images[@]}"; do
+                  resolve_image_dependencies "$dockerfile"
+                done
+              fi
+
+              if [ "$target_build_type" = "runtimes" ] || [ "$target_build_type" = "all" ]; then
+                for dockerfile in "${_selected_runtime_base_images[@]}"; do
+                  resolve_image_dependencies "$dockerfile"
+                done
+              fi
+            elif [ "$target_build_type" = "images" ] || [ "$target_build_type" = "all" ]; then
+              mark_selected_image_stage
+            fi
+
+            if [ "$target_build_type" = "all" ] || [ "$target_build_type" = "runtimes" ]; then
+              mark_selected_runtime_stage
+            fi
+
+            if [ "$target_build_type" != "runtimes" ] || [ "$include_prerequisites" = "true" ]; then
+              case "$target_kind" in
+                operating-systems) fallback_names[os_base]="$target_name" ;;
+                languages) fallback_names[language_base]="$target_name" ;;
+                frameworks) fallback_names[framework_base]="$target_name" ;;
+              esac
+            fi
+          elif [ "$target_kind" = "all" ]; then
+            case "$target_build_type" in
+              all)
+                flags[build_tools]=true
+                flags[build_os_base]=true
+                flags[build_language_base]=true
+                flags[build_framework_base]=true
+                flags[build_os_runtime]=true
+                flags[build_language_runtime]=true
+                flags[build_framework_runtime]=true
+                ;;
+              images)
+                flags[build_tools]=true
+                flags[build_os_base]=true
+                flags[build_language_base]=true
+                flags[build_framework_base]=true
+                ;;
+              runtimes)
+                if [ "$include_prerequisites" = "true" ]; then
+                  flags[build_tools]=true
+                  flags[build_os_base]=true
+                  flags[build_language_base]=true
+                  flags[build_framework_base]=true
+                fi
+                flags[build_os_runtime]=true
+                flags[build_language_runtime]=true
+                flags[build_framework_runtime]=true
+                ;;
+              *)
+                echo "Error: unsupported target_build_type '$target_build_type'" >&2
+                exit 1
+                ;;
+            esac
+          else
+            case "$target_kind" in
+              operating-systems)
+                if [ "$target_build_type" = "all" ] || [ "$target_build_type" = "images" ]; then
+                  if [ "$include_prerequisites" = "true" ]; then
+                    flags[build_tools]=true
+                  fi
+                  flags[build_os_base]=true
+                fi
+                if [ "$target_build_type" = "all" ] || [ "$target_build_type" = "runtimes" ]; then
+                  if [ "$include_prerequisites" = "true" ]; then
+                    flags[build_tools]=true
+                    flags[build_os_base]=true
+                  fi
+                  flags[build_os_runtime]=true
+                fi
+                ;;
+              languages)
+                if [ "$include_prerequisites" = "true" ]; then
+                  flags[build_tools]=true
+                  flags[build_os_base]=true
+                fi
+                if [ "$target_build_type" = "all" ] || [ "$target_build_type" = "images" ]; then
+                  flags[build_language_base]=true
+                fi
+                if [ "$target_build_type" = "all" ] || [ "$target_build_type" = "runtimes" ]; then
+                  if [ "$include_prerequisites" = "true" ]; then
+                    flags[build_language_base]=true
+                  fi
+                  flags[build_language_runtime]=true
+                fi
+                ;;
+              frameworks)
+                if [ "$include_prerequisites" = "true" ]; then
+                  flags[build_tools]=true
+                  flags[build_os_base]=true
+                  flags[build_language_base]=true
+                fi
+                if [ "$target_build_type" = "all" ] || [ "$target_build_type" = "images" ]; then
+                  flags[build_framework_base]=true
+                fi
+                if [ "$target_build_type" = "all" ] || [ "$target_build_type" = "runtimes" ]; then
+                  if [ "$include_prerequisites" = "true" ]; then
+                    flags[build_framework_base]=true
+                  fi
+                  flags[build_framework_runtime]=true
+                fi
+                ;;
+              *)
+                echo "Error: unsupported target kind '$target_kind'" >&2
+                exit 1
+                ;;
+            esac
+          fi
+
+          os_base_name="$(finalize_stage_name os_base)"
+          language_base_name="$(finalize_stage_name language_base)"
+          framework_base_name="$(finalize_stage_name framework_base)"
+
+          {
+            echo "build_tools=${flags[build_tools]}"
+            echo "effective_tools_version=$EFFECTIVE_TOOLS_VERSION"
+            echo "build_os_base=${flags[build_os_base]}"
+            echo "os_base_name=$os_base_name"
+            echo "build_language_base=${flags[build_language_base]}"
+            echo "language_base_name=$language_base_name"
+            echo "build_framework_base=${flags[build_framework_base]}"
+            echo "framework_base_name=$framework_base_name"
+            echo "build_os_runtime=${flags[build_os_runtime]}"
+            echo "os_runtime_name=${fallback_names[os_runtime]}"
+            echo "build_language_runtime=${flags[build_language_runtime]}"
+            echo "language_runtime_name=${fallback_names[language_runtime]}"
+            echo "build_framework_runtime=${flags[build_framework_runtime]}"
+            echo "framework_runtime_name=${fallback_names[framework_runtime]}"
+          } >> "$GITHUB_OUTPUT"
+
+          show_stage() {
+            local label="$1"
+            local enabled="$2"
+            local scope="$3"
+            if [ "$enabled" = "true" ]; then
+              if [ -n "$scope" ]; then
+                printf -- '- %s: `%s`\n' "$label" "$scope"
+              else
+                printf -- "- %s: all\n" "$label"
+              fi
+            else
+              printf -- "- %s: skipped\n" "$label"
+            fi
+          }
+
+          {
+            echo "## Requested Build Plan"
+            printf -- '- Target kind: `%s`\n' "$target_kind"
+            if [ -n "$target_name" ]; then
+              printf -- '- Target name: `%s`\n' "$target_name"
+            else
+              echo "- Target name: all"
+            fi
+            printf -- '- Target build type: `%s`\n' "$target_build_type"
+            printf -- '- Include prerequisites: `%s`\n' "$include_prerequisites"
+            printf -- '- Effective tools version when reused: `%s`\n' "$EFFECTIVE_TOOLS_VERSION"
+            if [ -n "$target_name" ] && [ "$target_build_type" = "runtimes" ] && [ "$include_prerequisites" != "true" ]; then
+              echo "- Note: prerequisites are disabled, so the required base images must already exist in the registry."
+            fi
+            echo
+            show_stage "Tools Image" "${flags[build_tools]}" ""
+            show_stage "Base Images (OS)" "${flags[build_os_base]}" "$os_base_name"
+            show_stage "Base Images (Languages)" "${flags[build_language_base]}" "$language_base_name"
+            show_stage "Base Images (Frameworks)" "${flags[build_framework_base]}" "$framework_base_name"
+            show_stage "Runtime Images (OS)" "${flags[build_os_runtime]}" "${fallback_names[os_runtime]}"
+            show_stage "Runtime Images (Languages)" "${flags[build_language_runtime]}" "${fallback_names[language_runtime]}"
+            show_stage "Runtime Images (Frameworks)" "${flags[build_framework_runtime]}" "${fallback_names[framework_runtime]}"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   build-tools:
     name: Tools Image
+    needs: resolve-plan
+    if: ${{ needs.resolve-plan.outputs.build_tools == 'true' }}
     uses: ./.github/workflows/build-expt-tools.yml
     with:
       image_tag: ${{ inputs.tools_version != '' && inputs.tools_version || inputs.tag }}
@@ -62,15 +515,15 @@ jobs:
 
   build-os-base:
     name: Base Images (OS)
-    needs: build-tools
-    if: ${{ always() && needs.build-tools.result == 'success' }}
+    needs: [resolve-plan, build-tools]
+    if: ${{ always() && needs.resolve-plan.outputs.build_os_base == 'true' && (needs.resolve-plan.outputs.build_tools != 'true' || needs['build-tools'].result == 'success') }}
     uses: ./.github/workflows/build-expt-image-or-runtime.yaml
     with:
       tag: ${{ inputs.tag }}
       kind: operating-systems
-      name: ''
+      name: ${{ needs.resolve-plan.outputs.os_base_name }}
       build_type: images
-      tools_version: ${{ needs['build-tools'].outputs.image_tag }}
+      tools_version: ${{ needs['build-tools'].result == 'success' && needs['build-tools'].outputs.image_tag || needs.resolve-plan.outputs.effective_tools_version }}
       os_version: ${{ inputs.os_version }}
       framework_image_version: ${{ inputs.framework_image_version }}
       l10n: ${{ inputs.l10n }}
@@ -80,15 +533,15 @@ jobs:
 
   build-language-base:
     name: Base Images (Languages)
-    needs: [build-tools, build-os-base]
-    if: ${{ always() && needs.build-tools.result == 'success' }}
+    needs: [resolve-plan, build-tools, build-os-base]
+    if: ${{ always() && needs.resolve-plan.outputs.build_language_base == 'true' && (needs.resolve-plan.outputs.build_tools != 'true' || needs['build-tools'].result == 'success') && (needs.resolve-plan.outputs.build_os_base != 'true' || needs['build-os-base'].result == 'success') }}
     uses: ./.github/workflows/build-expt-image-or-runtime.yaml
     with:
       tag: ${{ inputs.tag }}
       kind: languages
-      name: ''
+      name: ${{ needs.resolve-plan.outputs.language_base_name }}
       build_type: images
-      tools_version: ${{ needs['build-tools'].outputs.image_tag }}
+      tools_version: ${{ needs['build-tools'].result == 'success' && needs['build-tools'].outputs.image_tag || needs.resolve-plan.outputs.effective_tools_version }}
       os_version: ${{ inputs.os_version }}
       framework_image_version: ${{ inputs.framework_image_version }}
       l10n: ${{ inputs.l10n }}
@@ -98,15 +551,15 @@ jobs:
 
   build-framework-base:
     name: Base Images (Frameworks)
-    needs: [build-tools, build-language-base]
-    if: ${{ always() && needs.build-tools.result == 'success' }}
+    needs: [resolve-plan, build-tools, build-os-base, build-language-base]
+    if: ${{ always() && needs.resolve-plan.outputs.build_framework_base == 'true' && (needs.resolve-plan.outputs.build_tools != 'true' || needs['build-tools'].result == 'success') && (needs.resolve-plan.outputs.build_os_base != 'true' || needs['build-os-base'].result == 'success') && (needs.resolve-plan.outputs.build_language_base != 'true' || needs['build-language-base'].result == 'success') }}
     uses: ./.github/workflows/build-expt-image-or-runtime.yaml
     with:
       tag: ${{ inputs.tag }}
       kind: frameworks
-      name: ''
+      name: ${{ needs.resolve-plan.outputs.framework_base_name }}
       build_type: images
-      tools_version: ${{ needs['build-tools'].outputs.image_tag }}
+      tools_version: ${{ needs['build-tools'].result == 'success' && needs['build-tools'].outputs.image_tag || needs.resolve-plan.outputs.effective_tools_version }}
       os_version: ${{ inputs.os_version }}
       framework_image_version: ${{ inputs.framework_image_version }}
       l10n: ${{ inputs.l10n }}
@@ -116,15 +569,15 @@ jobs:
 
   build-os-runtime:
     name: Runtime Images (OS)
-    needs: [build-tools, build-framework-base]
-    if: ${{ always() && needs.build-tools.result == 'success' }}
+    needs: [resolve-plan, build-tools, build-os-base]
+    if: ${{ always() && needs.resolve-plan.outputs.build_os_runtime == 'true' && (needs.resolve-plan.outputs.build_tools != 'true' || needs['build-tools'].result == 'success') && (needs.resolve-plan.outputs.build_os_base != 'true' || needs['build-os-base'].result == 'success') }}
     uses: ./.github/workflows/build-expt-image-or-runtime.yaml
     with:
       tag: ${{ inputs.tag }}
       kind: operating-systems
-      name: ''
+      name: ${{ needs.resolve-plan.outputs.os_runtime_name }}
       build_type: runtimes
-      tools_version: ${{ needs['build-tools'].outputs.image_tag }}
+      tools_version: ${{ needs['build-tools'].result == 'success' && needs['build-tools'].outputs.image_tag || needs.resolve-plan.outputs.effective_tools_version }}
       os_version: ${{ inputs.os_version }}
       framework_image_version: ${{ inputs.framework_image_version }}
       l10n: ${{ inputs.l10n }}
@@ -134,15 +587,15 @@ jobs:
 
   build-language-runtime:
     name: Runtime Images (Languages)
-    needs: [build-tools, build-os-runtime]
-    if: ${{ always() && needs.build-tools.result == 'success' }}
+    needs: [resolve-plan, build-tools, build-language-base]
+    if: ${{ always() && needs.resolve-plan.outputs.build_language_runtime == 'true' && (needs.resolve-plan.outputs.build_tools != 'true' || needs['build-tools'].result == 'success') && (needs.resolve-plan.outputs.build_language_base != 'true' || needs['build-language-base'].result == 'success') }}
     uses: ./.github/workflows/build-expt-image-or-runtime.yaml
     with:
       tag: ${{ inputs.tag }}
       kind: languages
-      name: ''
+      name: ${{ needs.resolve-plan.outputs.language_runtime_name }}
       build_type: runtimes
-      tools_version: ${{ needs['build-tools'].outputs.image_tag }}
+      tools_version: ${{ needs['build-tools'].result == 'success' && needs['build-tools'].outputs.image_tag || needs.resolve-plan.outputs.effective_tools_version }}
       os_version: ${{ inputs.os_version }}
       framework_image_version: ${{ inputs.framework_image_version }}
       l10n: ${{ inputs.l10n }}
@@ -152,15 +605,15 @@ jobs:
 
   build-framework-runtime:
     name: Runtime Images (Frameworks)
-    needs: [build-tools, build-language-runtime]
-    if: ${{ always() && needs.build-tools.result == 'success' }}
+    needs: [resolve-plan, build-tools, build-framework-base]
+    if: ${{ always() && needs.resolve-plan.outputs.build_framework_runtime == 'true' && (needs.resolve-plan.outputs.build_tools != 'true' || needs['build-tools'].result == 'success') && (needs.resolve-plan.outputs.build_framework_base != 'true' || needs['build-framework-base'].result == 'success') }}
     uses: ./.github/workflows/build-expt-image-or-runtime.yaml
     with:
       tag: ${{ inputs.tag }}
       kind: frameworks
-      name: ''
+      name: ${{ needs.resolve-plan.outputs.framework_runtime_name }}
       build_type: runtimes
-      tools_version: ${{ needs['build-tools'].outputs.image_tag }}
+      tools_version: ${{ needs['build-tools'].result == 'success' && needs['build-tools'].outputs.image_tag || needs.resolve-plan.outputs.effective_tools_version }}
       os_version: ${{ inputs.os_version }}
       framework_image_version: ${{ inputs.framework_image_version }}
       l10n: ${{ inputs.l10n }}
@@ -172,6 +625,7 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       [
+        resolve-plan,
         build-tools,
         build-os-base,
         build-language-base,
@@ -188,6 +642,7 @@ jobs:
         with:
           pattern: image-list-*
           path: image-lists
+
       - name: Write image list summary
         if: always()
         shell: bash
@@ -196,6 +651,7 @@ jobs:
           if [ -d image-lists ]; then
             find image-lists -type f -print0 | xargs -0 cat | sed '/^[[:space:]]*$/d' | sort -u > "$GITHUB_STEP_SUMMARY"
           fi
-      - name: Fail if any builds failed
-        if: ${{ !(needs.build-tools.result == 'success' && needs.build-os-base.result == 'success' && needs.build-language-base.result == 'success' && needs.build-framework-base.result == 'success' && needs.build-os-runtime.result == 'success' && needs.build-language-runtime.result == 'success' && needs.build-framework-runtime.result == 'success') }}
+
+      - name: Fail if any planned builds failed
+        if: ${{ needs['resolve-plan'].result != 'success' || (needs.resolve-plan.outputs.build_tools == 'true' && needs['build-tools'].result != 'success') || (needs.resolve-plan.outputs.build_os_base == 'true' && needs['build-os-base'].result != 'success') || (needs.resolve-plan.outputs.build_language_base == 'true' && needs['build-language-base'].result != 'success') || (needs.resolve-plan.outputs.build_framework_base == 'true' && needs['build-framework-base'].result != 'success') || (needs.resolve-plan.outputs.build_os_runtime == 'true' && needs['build-os-runtime'].result != 'success') || (needs.resolve-plan.outputs.build_language_runtime == 'true' && needs['build-language-runtime'].result != 'success') || (needs.resolve-plan.outputs.build_framework_runtime == 'true' && needs['build-framework-runtime'].result != 'success') }}
         run: exit 1
