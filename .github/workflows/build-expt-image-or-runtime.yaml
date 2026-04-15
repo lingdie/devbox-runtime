@@ -132,140 +132,35 @@ jobs:
   define-matrix:
     runs-on: ubuntu-latest
     outputs:
-      tag: ${{ steps.set_tag.outputs.tag }}
-      framework_image_version: ${{ steps.set_tag.outputs.framework_image_version }}
-      tools_version: ${{ steps.set_tag.outputs.tools_version }}
-      os_version: ${{ steps.set_tag.outputs.os_version }}
-      l10n_matrix: ${{ steps.set_matrix.outputs.l10n_matrix }}
-      arch_matrix: ${{ steps.set_matrix.outputs.arch_matrix }}
-      platforms: ${{ steps.set_matrix.outputs.platforms }}
-      platforms_include_amd64: ${{ steps.set_matrix.outputs.platforms_include_amd64 }}
-      aliyun_enabled: ${{ steps.normalize_flags.outputs.aliyun_enabled }}
-      packages: ${{ steps.get_packages.outputs.packages }}
+      tag: ${{ steps.prepare.outputs.tag }}
+      framework_image_version: ${{ steps.prepare.outputs.framework_image_version }}
+      tools_version: ${{ steps.prepare.outputs.tools_version }}
+      os_version: ${{ steps.prepare.outputs.os_version }}
+      l10n_matrix: ${{ steps.prepare.outputs.l10n_matrix }}
+      arch_matrix: ${{ steps.prepare.outputs.arch_matrix }}
+      platforms: ${{ steps.prepare.outputs.platforms }}
+      platforms_include_amd64: ${{ steps.prepare.outputs.platforms_include_amd64 }}
+      aliyun_enabled: ${{ steps.prepare.outputs.aliyun_enabled }}
+      packages: ${{ steps.prepare.outputs.packages }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Set up tag
-        id: set_tag
+      - name: Prepare build parameters
+        id: prepare
         run: |
-          if [ -n "${{ inputs.tag }}" ]; then
-            tag=${{ inputs.tag }}
-          else
-            tag=$(echo "${{ github.sha }}" | cut -c1-7)
-          fi
-          # Set tools_version: use inputs.tools_version if provided, otherwise use tag
-          if [ -n "${{ inputs.tools_version }}" ]; then
-            tools_version=${{ inputs.tools_version }}
-          else
-            tools_version=$tag
-          fi
-          # Set os_version: use inputs.os_version if provided, otherwise use tag
-          if [ -n "${{ inputs.os_version }}" ]; then
-            os_version=${{ inputs.os_version }}
-          else
-            os_version=$tag
-          fi
-          # Set framework_image_version: use inputs.framework_image_version if provided, otherwise use tag
-          if [ -n "${{ inputs.framework_image_version }}" ]; then
-            framework_image_version=${{ inputs.framework_image_version }}
-          else
-            framework_image_version=$tag
-          fi
-          echo "tag=$tag" >> $GITHUB_OUTPUT
-          echo "framework_image_version=$framework_image_version" >> $GITHUB_OUTPUT
-          echo "tools_version=$tools_version" >> $GITHUB_OUTPUT
-          echo "os_version=$os_version" >> $GITHUB_OUTPUT
-
-      - name: Build localization and architecture matrix
-        id: set_matrix
-        run: |
-          l10n_values=()
-          case "${{ inputs.l10n }}" in
-            en_US)
-              l10n_values+=('{"display":"en_US","normalized":"en-us"}')
-              ;;
-            zh_CN)
-              l10n_values+=('{"display":"zh_CN","normalized":"zh-cn"}')
-              ;;
-            both)
-              l10n_values+=('{"display":"en_US","normalized":"en-us"}')
-              l10n_values+=('{"display":"zh_CN","normalized":"zh-cn"}')
-              ;;
-            *)
-              echo "Error: Unknown l10n option '${{ inputs.l10n }}'." >&2
-              exit 1
-              ;;
-          esac
-          l10n_matrix=$(printf '%s\n' "${l10n_values[@]}" | jq -s -c '.')
-
-          # Single platforms string for buildx (one job builds all requested arches, manifest list)
-          case "${{ inputs.arch }}" in
-            amd64)
-              platforms="linux/amd64"
-              platforms_include_amd64="true"
-              ;;
-            arm64)
-              platforms="linux/arm64"
-              platforms_include_amd64="false"
-              ;;
-            both)
-              platforms="linux/amd64,linux/arm64"
-              platforms_include_amd64="true"
-              ;;
-            *)
-              echo "Error: Unknown arch option '${{ inputs.arch }}'." >&2
-              exit 1
-              ;;
-          esac
-          echo "platforms=$platforms" >> $GITHUB_OUTPUT
-          echo "platforms_include_amd64=$platforms_include_amd64" >> $GITHUB_OUTPUT
-          # Keep arch_matrix for any consumers (e.g. step summary); single arch or both
-          arch_values=()
-          case "${{ inputs.arch }}" in
-            amd64) arch_values+=("amd64") ;;
-            arm64) arch_values+=("arm64") ;;
-            both)  arch_values+=("amd64") ; arch_values+=("arm64") ;;
-          esac
-          arch_matrix=$(printf '%s\n' "${arch_values[@]}" | jq -R -s -c 'split("\n")[:-1]')
-          echo "arch_matrix=$arch_matrix" >> $GITHUB_OUTPUT
-
-          echo "l10n_matrix=$l10n_matrix" >> $GITHUB_OUTPUT
-
-      - name: Normalize boolean inputs
-        id: normalize_flags
-        run: |
-          echo "aliyun_enabled=${{ inputs.aliyun_enabled && 'true' || 'false' }}" >> $GITHUB_OUTPUT
-
-      - name: Get packages
-        id: get_packages
-        run: |
-          # Get all packages
-          kind=${{ inputs.kind }}
-          name=${{ inputs.name }}
-          build_type=${{ inputs.build_type }}
-          if [ -n "$name" ]; then
-            echo "Looking for specific package: $name"
-            target_dockerfiles=$(find "experimental/$build_type/$kind/$name" -name "Dockerfile" | sort)
-            if [ -z "$target_dockerfiles" ]; then
-              echo "Error: No Dockerfile found for package '$name' in kind '$kind'" >&2
-              exit 1
-            fi
-          else
-            echo "No specific package provided, gathering all packages of kind: $kind"
-            target_dockerfiles=$(find "experimental/$build_type/$kind" -name "Dockerfile" | sort)
-          fi
-
-          # Convert to JSON array
-          packages=$(echo "$target_dockerfiles" | jq -R -s 'split("\n")[:-1]')
-
-          echo "packages<<EOF" >> $GITHUB_OUTPUT
-          echo "$packages" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-          package_count=$(echo "$packages" | jq 'length // 0')
-          echo "Found $package_count packages to build"
+          python3 .github/scripts/expt-build.py define-matrix \
+            --tag "${{ inputs.tag }}" \
+            --tools-version "${{ inputs.tools_version }}" \
+            --os-version "${{ inputs.os_version }}" \
+            --framework-image-version "${{ inputs.framework_image_version }}" \
+            --l10n "${{ inputs.l10n }}" \
+            --arch "${{ inputs.arch }}" \
+            --kind "${{ inputs.kind }}" \
+            --name "${{ inputs.name }}" \
+            --build-type "${{ inputs.build_type }}" \
+            --aliyun-enabled "${{ inputs.aliyun_enabled }}"
 
   # Build expt images
   build-expt-images:
@@ -387,10 +282,10 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
           if [ -n "${{ steps.generate-standard.outputs.ghcr_image_name }}" ]; then
-            echo "- ${{ steps.generate-standard.outputs.ghcr_image_name }}" >> $GITHUB_STEP_SUMMARY
+            echo "- ${{ steps.generate-standard.outputs.ghcr_image_name }}" >> "$GITHUB_STEP_SUMMARY"
           fi
           if [ -n "${{ steps.generate-standard.outputs.acr_image_name }}" ]; then
-            echo "- ${{ steps.generate-standard.outputs.acr_image_name }}" >> $GITHUB_STEP_SUMMARY
+            echo "- ${{ steps.generate-standard.outputs.acr_image_name }}" >> "$GITHUB_STEP_SUMMARY"
           fi
 
   create-manifests:
@@ -484,8 +379,8 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' }}
         run: |
           if [ -n "${{ steps.generate-base.outputs.ghcr_image_name }}" ]; then
-            echo "- ${{ steps.generate-base.outputs.ghcr_image_name }}" >> $GITHUB_STEP_SUMMARY
+            echo "- ${{ steps.generate-base.outputs.ghcr_image_name }}" >> "$GITHUB_STEP_SUMMARY"
           fi
           if [ -n "${{ steps.generate-base.outputs.acr_image_name }}" ]; then
-            echo "- ${{ steps.generate-base.outputs.acr_image_name }}" >> $GITHUB_STEP_SUMMARY
+            echo "- ${{ steps.generate-base.outputs.acr_image_name }}" >> "$GITHUB_STEP_SUMMARY"
           fi
