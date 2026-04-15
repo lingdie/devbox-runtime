@@ -1,104 +1,61 @@
 # Experimental 镜像构建工作流
 
-本文档说明以下两个 GitHub Actions 工作流的使用方式：
+本文档说明 experimental 构建的唯一入口：
 
-- `.github/workflows/build-all-expt-images-and-runtimes.yaml`
-- `.github/workflows/build-expt-image-or-runtime.yaml`
+- `.github/workflows/build-expt.yaml`
 
-它们对应 `experimental/images/` 和 `experimental/runtimes/` 下的构建流程，用于发布 experimental base images 与 runtime images。
+它对应 `experimental/images/` 和 `experimental/runtimes/` 下的构建流程，用于发布 experimental base images 与 runtime images。旧的 expt workflow 已删除，不再使用。
 
 ## 什么时候用哪个工作流
 
-### `build-all-expt-images-and-runtimes.yaml`
+### `build-expt.yaml`（推荐）
 
 适合以下场景：
 
-- 全量发布 experimental images + runtimes
-- 构建某一类镜像，例如所有 language images
-- 单独构建一个 framework runtime，并自动补齐上游依赖链
+- 一次触发完成目标及依赖链
+- 降低手工输入字段数量
+- 需要在不改 GitHub Secrets 名称的前提下支持阿里云推送
 
-这是推荐的入口。它会先解析构建目标，再决定是否需要先构建：
+核心输入（简化）：
 
-- `base-tools`
-- OS images
-- language images
-- framework images
-- runtimes
+- `release_tag`: 本次发布版本
+- `target`: `all | os/<path> | lang/<path> | fw/<path> | runtime/<path>`
+- `profile`: `quick | full | release`
+- `overrides_json`: 可选版本覆盖（`tools/os/framework/node/runtime`）
+- `l10n`/`arch`/`aliyun_enabled`: 常用可选项
 
-### `build-expt-image-or-runtime.yaml`
+其中：
 
-适合以下场景：
+- `full` 会自动补齐依赖（推荐默认）
+- `quick` 只构建目标本身（依赖需提前存在）
+- `release` 会自动使用 `l10n=both`、`arch=both`
 
-- 只想构建某一层，例如只构建 `experimental/images/frameworks/...`
-- 已经确认上游镜像存在，只想单独重跑某个 kind/build_type
-- 作为 reusable workflow 被其他 workflow 调用
+## 推荐用法（新入口）
 
-它不会自动推导完整依赖链，只会按传入的 `kind + name + build_type` 构建当前这一层。
+### 1. 全量发布所有 experimental images 和 runtimes（一次触发）
 
-## 推荐用法
+在 `build-expt.yaml` 中使用：
 
-### 1. 全量发布所有 experimental images 和 runtimes
+- `target=all`
+- `profile=release`
 
-在 `build-all-expt-images-and-runtimes.yaml` 中使用：
+### 2. 只构建单个 framework runtime，并补齐依赖
 
-- `target_kind=all`
-- `target_name=` 留空
-- `target_build_type=all`
-- `include_prerequisites=true`
+- `target=runtime/fw/<framework>/<version>`，例如 `runtime/fw/sandbox/v1`
+- `profile=full`
 
-### 2. 只构建所有 framework runtimes
+这会先构建 runtime 需要的 framework image；如果上游 language/OS/tools 缺失，也会一起补齐。
 
-- `target_kind=frameworks`
-- `target_name=` 留空
-- `target_build_type=runtimes`
-- `include_prerequisites=true`
+### 3. 只重跑单层，不补前置
 
-这会先构建 framework runtimes 需要的 framework images；如果上游 language/OS/tools 缺失，也会一起补齐。
-
-### 3. 单独构建一个 framework runtime
-
-例如构建 `experimental/runtimes/frameworks/nest.js/v11/Dockerfile`：
-
-- `target_kind=frameworks`
-- `target_name=nest.js/v11`
-- `target_build_type=runtimes`
-- `include_prerequisites=true`
-
-这时工作流会自动规划并串行触发所需阶段。以 `nest.js/v11` 为例，当前依赖链会补齐到：
-
-- `base-tools`
-- `experimental/images/operating-systems/debian/12.6`
-- `experimental/images/languages/node.js/20`
-- `experimental/images/frameworks/nest.js/v11`
-- `experimental/runtimes/frameworks/nest.js/v11`
-
-这正是单个 framework runtime 最推荐的触发方式。
-
-### 4. 只重跑某个 image，不补前置
-
-例如只重跑 `experimental/images/languages/node.js/20/Dockerfile`：
-
-- `target_kind=languages`
-- `target_name=node.js/20`
-- `target_build_type=images`
-- `include_prerequisites=false`
-
-这种模式适合你已经确认上游镜像都在 registry 中可用，只想重建当前目标本身。
-
-### 5. 只重跑某个 runtime，不补前置
-
-例如只重跑 `experimental/runtimes/frameworks/openclaw/latest/Dockerfile`：
-
-- `target_kind=frameworks`
-- `target_name=openclaw/latest`
-- `target_build_type=runtimes`
-- `include_prerequisites=false`
+- `target=fw/sandbox/v1`（或 `runtime/fw/sandbox/v1`）
+- `profile=quick`
 
 注意：这要求它依赖的 base image 已经存在于目标 registry 中，否则构建会在 `FROM` 阶段失败。
 
 ## 关键输入说明
 
-### `tag`
+### `release_tag`
 
 最终镜像 tag 的主版本号。大多数场景直接传本次发布版本，例如：
 
@@ -106,81 +63,50 @@
 - `2026-04-14`
 - `latest`
 
-### `tools_version`
+### `overrides_json`
 
-仅在需要复用已存在的 `base-tools` 时覆盖。留空时默认跟随 `tag`。
+用于高级覆盖依赖版本，JSON 格式：
 
-### `os_version`
+```json
+{"tools":"v0.4.2","os":"v0.4.2","framework":"v0.4.2","node":"latest","runtime":"latest"}
+```
 
-仅在需要复用已发布的 experimental OS image 时覆盖。留空时默认跟随 `tag`。
+未提供的键默认跟随 `release_tag`。`runtime` 未提供时默认跟随 `node`。
 
-### `framework_image_version`
+### `profile`
 
-仅在 runtime 构建时需要复用已存在 framework image 时覆盖。留空时默认跟随 `tag`。
+- `quick`: 不补前置依赖，速度快
+- `full`: 补齐依赖链，适合日常手工构建
+- `release`: 补齐依赖链 + 强制 `l10n=both` + `arch=both`
 
-### `target_kind`
+### `target`
 
-控制当前构建要聚焦哪一类：
+统一目标字段，支持：
 
 - `all`
-- `operating-systems`
-- `languages`
-- `frameworks`
+- `os/<path>`（例：`os/debian/12.6`）
+- `lang/<path>`（例：`lang/node.js/22`）
+- `fw/<path>`（例：`fw/sandbox/v1`）
+- `runtime/<path>`（默认 framework runtime）
+- `runtime/os/<path>`、`runtime/lang/<path>`、`runtime/fw/<path>`
 
-### `target_name`
+### `aliyun_enabled`
 
-可选的精确目标路径，格式是 `kind` 下的相对子路径，不带 `experimental/...` 前缀，也不带 `Dockerfile`。
-
-示例：
-
-- `debian/12.6`
-- `ubuntu/22.04`
-- `node.js/20`
-- `python/3.12`
-- `nest.js/v11`
-- `openclaw/latest`
-
-### `target_build_type`
-
-- `all`: images + runtimes 都构建
-- `images`: 只构建 `experimental/images`
-- `runtimes`: 只构建 `experimental/runtimes`
-
-### `include_prerequisites`
-
-这是新的关键开关：
-
-- `true`: 自动构建所需上游依赖，适合手动触发单个 runtime
-- `false`: 只构建当前目标，适合重跑单层任务
-
-如果你不确定选哪个，优先用 `true`。
-
-### `l10n`
+### `l10n`（`profile=release` 时自动忽略）
 
 - `en_US`
 - `zh_CN`
 - `both`
 
-### `arch`
+### `arch`（`profile=release` 时自动忽略）
 
 - `amd64`
 - `arm64`
 - `both`
 
-### `aliyun_enabled`
-
-开启后会执行：
-
-- Aliyun ACR 登录
-- Aliyun 镜像 tag 生成
-- Aliyun 镜像 push
-- Aliyun manifest 创建
-
-如果不开启，则只推送到 GHCR。
-
 ## 阿里云推送需要的 Secrets
 
-`build-expt-image-or-runtime.yaml` 通过 reusable workflow 方式接收以下 secrets：
+新旧 workflow 都继续使用以下同名 secrets（名称不变）：
 
 - `ALIYUN_REGISTRY`
 - `ALIYUN_USERNAME`
@@ -205,17 +131,9 @@
 
 ## 常见问题
 
-### 为什么以前单独构建一个 framework runtime 要手动跑很多次
+### 构建 `sandbox` 需要手动触发几次
 
-因为 runtime 自身只构建当前层，但它的 `FROM` 会引用 framework image；framework image 又可能引用 language image；language image 再引用 OS image 和 `base-tools`。如果工作流不帮你补前置，就只能手动逐层跑。
-
-现在推荐直接用：
-
-- `build-all-expt-images-and-runtimes.yaml`
-- `target_kind=frameworks`
-- `target_name=<framework>/<version>`
-- `target_build_type=runtimes`
-- `include_prerequisites=true`
+推荐用 `build-expt.yaml` + `target=fw/sandbox/v1`（或 `runtime/fw/sandbox/v1`）+ `profile=full`，只需要触发 **1 次**。
 
 ### 为什么只开了阿里云开关，但没有推送成功
 
@@ -228,27 +146,28 @@
 
 如果前面的 per-arch 镜像没有推送成功，manifest 阶段也不会成功。
 
-### `target_name` 应该填什么
+### `target` 应该填什么
 
-填 `experimental/images/<kind>/` 或 `experimental/runtimes/<kind>/` 之后的子路径。
+填法统一为：
 
-不要填：
+- `fw/sandbox/v1`（只构建 framework image）
+- `runtime/fw/sandbox/v1`（构建 framework runtime）
+- `lang/node.js/22`、`runtime/lang/node.js/22`
+- `os/debian/12.6`、`runtime/os/debian/12.6`
 
-- `experimental/images/frameworks/nest.js/v11/Dockerfile`
+不要填 Dockerfile 全路径，例如：
 
-应该填：
-
-- `nest.js/v11`
+- `experimental/images/frameworks/sandbox/v1/Dockerfile`
 
 ## 建议
 
-如果目标是“我就想把一个 framework runtime 发出来”，优先使用：
+如果目标是“构建一个 framework runtime 并补齐依赖”，推荐：
 
-- `build-all-expt-images-and-runtimes.yaml`
-- `target_build_type=runtimes`
-- `include_prerequisites=true`
+- `target=runtime/fw/<framework>/<version>`
+- `profile=full`
 
-如果目标是“我知道依赖都在，只重跑这一层”，再使用：
+如果目标是“依赖都在，只重跑这一层”，推荐：
 
-- `build-expt-image-or-runtime.yaml`
+- `target=fw/<framework>/<version>` 或 `target=runtime/fw/<framework>/<version>`
+- `profile=quick`
 
