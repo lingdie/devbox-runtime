@@ -28,7 +28,7 @@ for f in $FILES; do
     TAGFLAGS="-t ghcr.io/${REPO_OWNER}/${REPO_NAME}/${image_name}:${TAG}"
     if [ "$ADD_LATEST" = 'true' ]; then TAGFLAGS+=" -t ghcr.io/${REPO_OWNER}/${REPO_NAME}/${image_name}:latest"; fi
     echo "PUSH: building and pushing ${REPO_NAME}/${image_name}:${TAG} for platforms ${PLATFORMS}"
-    eval docker buildx build --progress=plain --platform "$PLATFORMS" $BUILD_ARGS $TAGFLAGS --push "$dir"
+    eval docker buildx build --progress=plain --platform "$PLATFORMS" $BUILD_ARGS $TAGFLAGS --output type=registry,oci-mediatypes=true,compression=estargz,force-compression=true "$dir"
   else
     echo "PR: building ${REPO_NAME}/${image_name} per-arch (no push)"
     IFS=',' read -r -a ARCHS <<< "${PLATFORMS//linux\//}"
